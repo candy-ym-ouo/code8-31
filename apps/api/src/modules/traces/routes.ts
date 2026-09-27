@@ -199,38 +199,43 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
     validateSinglePage(parsed.data.pageNumber, book.pageCount);
     const reason = parsed.data.reason ? normalizeText(parsed.data.reason) : null;
-    const existing = await prisma.dogEar.findFirst({
-      where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
-    });
-    if (existing) {
-      if ((existing.reason ?? '') === (reason ?? '')) {
-        return reply.status(200).send({ dogEar: serializeDogEar(existing), idempotent: true });
-      }
-      throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
-    }
 
-    try {
-      const dogEar = await prisma.$transaction(async (tx) => {
-        const created = await tx.dogEar.create({
-          data: { userId, bookId, pageNumber: parsed.data.pageNumber, reason }
-        });
-        await writeEvent(tx, {
-          userId,
-          bookId,
-          entityType: 'DOG_EAR',
-          entityId: created.id,
-          action: 'CREATED',
-          payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
-        });
-        return created;
+    // 查重与插入之间存在并发窗口：撞唯一索引后重查，内容相同则幂等返回已有记录，确保重试结果一致
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const existing = await prisma.dogEar.findFirst({
+        where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
       });
-      return reply.status(201).send({ dogEar: serializeDogEar(dogEar) });
-    } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      if (existing) {
+        if ((existing.reason ?? '') === (reason ?? '')) {
+          return reply.status(200).send({ dogEar: serializeDogEar(existing), idempotent: true });
+        }
         throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
       }
-      throw error;
+
+      try {
+        const dogEar = await prisma.$transaction(async (tx) => {
+          const created = await tx.dogEar.create({
+            data: { userId, bookId, pageNumber: parsed.data.pageNumber, reason }
+          });
+          await writeEvent(tx, {
+            userId,
+            bookId,
+            entityType: 'DOG_EAR',
+            entityId: created.id,
+            action: 'CREATED',
+            payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+          });
+          return created;
+        });
+        return reply.status(201).send({ dogEar: serializeDogEar(dogEar) });
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+          continue;
+        }
+        throw error;
+      }
     }
+    throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
   });
 
   app.patch('/dog-ears/:dogEarId', async (request) => {
