@@ -111,6 +111,10 @@ function eventSummary(value: string | null | undefined): string {
   return (value ? normalizeText(value).slice(0, 120) : '');
 }
 
+function isSameDogEar(existing: { reason: string | null }, reason: string | null): boolean {
+  return (existing.reason ?? '') === (reason ?? '');
+}
+
 export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
 
@@ -203,7 +207,7 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
     });
     if (existing) {
-      if ((existing.reason ?? '') === (reason ?? '')) {
+      if (isSameDogEar(existing, reason)) {
         return reply.status(200).send({ dogEar: serializeDogEar(existing), idempotent: true });
       }
       throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
@@ -227,6 +231,15 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(201).send({ dogEar: serializeDogEar(dogEar) });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        // 并发相同提交：另一个请求已抢先写入同一页。唯一索引冲突只会在对方
+        // 事务提交后抛出，因此这里重新读取一定能看到已提交的记录。内容相同
+        // 时按幂等成功返回，保证重试结果一致且全书只留下一条折角。
+        const winner = await prisma.dogEar.findFirst({
+          where: { bookId, pageNumber: parsed.data.pageNumber, deletedAt: null }
+        });
+        if (winner && isSameDogEar(winner, reason)) {
+          return reply.status(200).send({ dogEar: serializeDogEar(winner), idempotent: true });
+        }
         throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有折角，请编辑原记录');
       }
       throw error;
